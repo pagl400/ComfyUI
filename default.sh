@@ -1,9 +1,18 @@
 #!/bin/bash
 
 source /venv/main/bin/activate
+
+COMFYUI_REPO="https://github.com/comfyanonymous/ComfyUI.git"
 COMFYUI_DIR=${WORKSPACE}/ComfyUI
 
-# Packages are installed after nodes so we can fix them...
+# ComfyUI klonen, wenn nicht vorhanden
+if [[ ! -d "$COMFYUI_DIR" ]]; then
+    echo "Cloning ComfyUI from $COMFYUI_REPO"
+    git clone "$COMFYUI_REPO" "$COMFYUI_DIR"
+else
+    echo "Updating existing ComfyUI repository"
+    (cd "$COMFYUI_DIR" && git pull)
+fi
 
 APT_PACKAGES=(
     #"package-1"
@@ -15,8 +24,14 @@ PIP_PACKAGES=(
     #"package-2"
 )
 
-# Lokale Custom Nodes aus dem ComfyUI-Repo einbinden
+# Externe Nodes via Git
 NODES=(
+    "https://github.com/ltdrdata/ComfyUI-Manager"
+    "https://github.com/cubiq/ComfyUI_essentials"
+)
+
+# Interne Nodes aus dem Haupt-ComfyUI-Repo
+INTERNAL_NODES=(
     "${COMFYUI_DIR}/custom_nodes/TrimVideoLatent"
     "${COMFYUI_DIR}/custom_nodes/WanVaceToVideo"
     "${COMFYUI_DIR}/custom_nodes/UnetLoaderGGUFDisTorchMultiGPU"
@@ -51,25 +66,14 @@ function provisioning_start() {
     provisioning_print_header
     provisioning_get_apt_packages
     provisioning_get_nodes
+    provisioning_get_internal_nodes
     provisioning_get_pip_packages
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/checkpoints" \
-        "${CHECKPOINT_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/unet" \
-        "${UNET_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/lora" \
-        "${LORA_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/controlnet" \
-        "${CONTROLNET_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/vae" \
-        "${VAE_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/esrgan" \
-        "${ESRGAN_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/checkpoints" "${CHECKPOINT_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/unet" "${UNET_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/lora" "${LORA_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/controlnet" "${CONTROLNET_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/vae" "${VAE_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/esrgan" "${ESRGAN_MODELS[@]}"
     provisioning_print_end
 }
 
@@ -87,40 +91,45 @@ function provisioning_get_pip_packages() {
 
 function provisioning_get_nodes() {
     for repo in "${NODES[@]}"; do
-        if [[ $repo == http* ]]; then
-            dir="${repo##*/}"
-            path="${COMFYUI_DIR}/custom_nodes/${dir}"
-        else
-            path="${repo}"
-        fi
-
+        dir="${repo##*/}"
+        path="${COMFYUI_DIR}/custom_nodes/${dir}"
         requirements="${path}/requirements.txt"
 
         if [[ -d $path ]]; then
-            if [[ ${AUTO_UPDATE,,} != "false" && -d $path/.git ]]; then
+            if [[ ${AUTO_UPDATE,,} != "false" ]]; then
                 printf "Updating node: %s...\n" "${repo}"
-                ( cd "$path" && git pull )
+                (cd "$path" && git pull)
+                if [[ -e $requirements ]]; then
+                    pip install --no-cache-dir -r "$requirements"
+                fi
             fi
+        else
+            printf "Downloading node: %s...\n" "${repo}"
+            git clone "${repo}" "${path}" --recursive
+            if [[ -e $requirements ]]; then
+                pip install --no-cache-dir -r "$requirements"
+            fi
+        fi
+    done
+}
+
+function provisioning_get_internal_nodes() {
+    for path in "${INTERNAL_NODES[@]}"; do
+        if [[ -d $path ]]; then
+            printf "Installing internal node: %s\n" "${path}"
+            requirements="${path}/requirements.txt"
             if [[ -e $requirements ]]; then
                 pip install --no-cache-dir -r "$requirements"
             fi
         else
-            if [[ $repo == http* ]]; then
-                printf "Downloading node: %s...\n" "${repo}"
-                git clone "${repo}" "${path}" --recursive
-                if [[ -e $requirements ]]; then
-                    pip install --no-cache-dir -r "${requirements}"
-                fi
-            else
-                echo "Warning: Local node path does not exist: $repo"
-            fi
+            echo "Warning: Internal node path not found: $path"
         fi
     done
 }
 
 function provisioning_get_files() {
     if [[ -z $2 ]]; then return 1; fi
-    
+
     dir="$1"
     mkdir -p "$dir"
     shift
@@ -149,11 +158,7 @@ function provisioning_has_valid_hf_token() {
         -H "Authorization: Bearer $HF_TOKEN" \
         -H "Content-Type: application/json")
 
-    if [ "$response" -eq 200 ]; then
-        return 0
-    else
-        return 1
-    fi
+    [[ "$response" -eq 200 ]]
 }
 
 function provisioning_has_valid_civitai_token() {
@@ -164,11 +169,7 @@ function provisioning_has_valid_civitai_token() {
         -H "Authorization: Bearer $CIVITAI_TOKEN" \
         -H "Content-Type: application/json")
 
-    if [ "$response" -eq 200 ]; then
-        return 0
-    else
-        return 1
-    fi
+    [[ "$response" -eq 200 ]]
 }
 
 function provisioning_download() {
@@ -177,13 +178,15 @@ function provisioning_download() {
     elif [[ -n $CIVITAI_TOKEN && $1 =~ ^https://([a-zA-Z0-9_-]+\.)?civitai\.com(/|$|\?) ]]; then
         auth_token="$CIVITAI_TOKEN"
     fi
-    if [[ -n $auth_token ]];then
+
+    if [[ -n $auth_token ]]; then
         wget --header="Authorization: Bearer $auth_token" -qnc --content-disposition --show-progress -e dotbytes="${3:-4M}" -P "$2" "$1"
     else
         wget -qnc --content-disposition --show-progress -e dotbytes="${3:-4M}" -P "$2" "$1"
     fi
 }
 
+# Automatisch Provisionierung ausführen, wenn nicht deaktiviert
 if [[ ! -f /.noprovisioning ]]; then
     provisioning_start
 fi
